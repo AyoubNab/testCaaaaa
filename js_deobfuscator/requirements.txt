@@ -2,3 +2,5 @@ esprima
 jsbeautifier
 asteval
 escodegen
+Flask
+py_mini_racer

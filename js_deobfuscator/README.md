@@ -42,6 +42,30 @@ python src/deobfuscator.py <path_to_input.js> <path_to_output.js>
 python src/deobfuscator.py samples/sample_obfuscated.js samples/sample_deobfuscated.js
 ```
 
+## Web Interface
+
+In addition to the command-line tool, this project includes a simple web interface built with Flask.
+
+### Running the Web App
+
+#### For Windows Users (Easy Way)
+
+Simply navigate to the `js_deobfuscator` directory and double-click the `start_web_app.bat` file.
+
+It will automatically check for dependencies, install them if needed, and launch the web server.
+
+#### Manual Installation (All Platforms)
+
+1.  Make sure you have installed all dependencies (`pip install -r requirements.txt`).
+2.  Navigate to the `js_deobfuscator` directory.
+3.  Run the web application:
+    ```bash
+    python src/web_app.py
+    ```
+4.  Open your web browser and go to `http://127.0.0.1:8080`.
+
+You can then paste your obfuscated code into the left text area and click "Deobfuscate" to see the result on the right.
+
 ## How It Works
 
 The deobfuscator works by parsing the source JavaScript into an Abstract Syntax Tree (AST) using the `esprima` library. An AST is a tree representation of the code's structure.
