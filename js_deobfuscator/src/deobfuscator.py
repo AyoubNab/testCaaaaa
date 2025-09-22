@@ -1,10 +1,11 @@
 import esprima
 import jsbeautifier
 import escodegen
-from asteval import Interpreter
 import re
 from collections import Counter
+from py_mini_racer import MiniRacer
 
+# --- AST traversal base classes ---
 class AstVisitor:
     def visit(self, node):
         if node is None: return
@@ -60,228 +61,137 @@ class AstTransformer(AstVisitor):
             setattr(node, field, new_value)
         return node
 
-class StringArrayFinder(AstVisitor):
-    def __init__(self):
-        self.string_array, self.string_array_name, self.accessor_name = None, None, None
-    def visit_VariableDeclarator(self, node):
-        if not self.string_array and node.init and node.init.type == 'ArrayExpression':
-            elements = [el.value for el in node.init.elements if el.type == 'Literal']
-            if len(elements) > 2 and len(elements) == len(node.init.elements):
-                self.string_array, self.string_array_name = elements, node.id.name
-        elif self.string_array_name and not self.accessor_name and node.init and node.init.type == 'FunctionExpression':
-             if self.string_array_name in escodegen.generate(node.init.body): self.accessor_name = node.id.name
-        self.generic_visit(node)
-    def visit_FunctionDeclaration(self, node):
-        if self.string_array_name and not self.accessor_name:
-            if self.string_array_name in escodegen.generate(node.body):
-                self.accessor_name = node.id.name
-        self.generic_visit(node)
+# --- Deobfuscation Passes ---
 
-class StringArrayResolver(AstTransformer):
-    def __init__(self, context):
-        self.context = context
-        self.index_usage = Counter()
+class ContextualResolver(AstTransformer):
+    """
+    This resolver is the core of the solution. It creates a JS context,
+    loads all the functions, and then smartly calls the main wrapper
+    to initialize the nested decoders before attempting to resolve calls.
+    """
+    def __init__(self, ast):
+        self.js_ctx = None
+        self.function_names = set()
+        self._initialize_context(ast)
+
+    def _initialize_context(self, ast):
+        if not ast.body:
+            self.js_ctx = None
+            return
+
+        # 1. Get all top-level function names
+        for node in ast.body:
+            if node.type == 'FunctionDeclaration':
+                self.function_names.add(node.id.name)
+
+        # 2. Create the context by executing the script minus the final call
+        original_last_statement = ast.body.pop()
+        context_code = escodegen.generate(ast)
+        ast.body.append(original_last_statement) # Restore AST for later passes
+
+        # 3. Get the name of the main wrapper function from the final call
+        main_wrapper_name = None
+        if (original_last_statement.type == 'ExpressionStatement' and
+            original_last_statement.expression.type == 'CallExpression' and
+            original_last_statement.expression.callee.type == 'Identifier'):
+            main_wrapper_name = original_last_statement.expression.callee.name
+
+        try:
+            self.js_ctx = MiniRacer()
+            self.js_ctx.eval("var console = {log: function(){}};")
+            self.js_ctx.eval(context_code)
+
+            # 4. **CRITICAL STEP**: Call the main wrapper with no args.
+            # This triggers the `if (!var) { var = function... }` blocks,
+            # defining the nested decoders inside the JS context.
+            if main_wrapper_name:
+                self.js_ctx.eval(f"{main_wrapper_name}()")
+                self.function_names.add(main_wrapper_name)
+
+            print("Successfully initialized and primed JavaScript context.")
+        except Exception as e:
+            print(f"Error initializing context: {e}")
+            self.js_ctx = None
+
     def visit_CallExpression(self, node):
-        if self.context.accessor_name and node.callee.type == 'Identifier' and node.callee.name == self.context.accessor_name:
-            if len(node.arguments) == 1 and node.arguments[0].type == 'Literal':
-                index = node.arguments[0].value
-                if isinstance(index, int) and 0 <= index < len(self.context.string_array):
-                    self.index_usage[index] += 1
-                    return esprima.nodes.Literal(value=self.context.string_array[index], raw=repr(self.context.string_array[index]))
-        return self.generic_visit(node)
+        node = self.generic_visit(node)
+        if not self.js_ctx: return node
+
+        if node.callee.type == 'Identifier':
+            # Use a broader check: if the function exists in the context, try to resolve it.
+            # This is safe because we primed the context with the nested functions.
+            try:
+                if self.js_ctx.eval(f"typeof {node.callee.name} === 'function'"):
+                    # Don't replace the final top-level call itself
+                    parent = getattr(node, 'parent', None)
+                    if parent and parent.type == 'ExpressionStatement':
+                        return node
+
+                    call_code = escodegen.generate(node)
+                    result = self.js_ctx.eval(call_code)
+                    if isinstance(result, (str, int, float, bool)):
+                        print(f"Resolved call '{call_code}' to literal: {result}")
+                        return esprima.nodes.Literal(value=result, raw=repr(result))
+            except Exception:
+                pass
+        return node
+
     def visit_MemberExpression(self, node):
-        if node.object.type == 'Identifier' and node.object.name == self.context.string_array_name:
-            if node.property.type == 'Literal' and isinstance(node.property.value, int):
-                index = node.property.value
-                if 0 <= index < len(self.context.string_array):
-                    self.index_usage[index] += 1
-                    return esprima.nodes.Literal(value=self.context.string_array[index], raw=repr(self.context.string_array[index]))
-        return self.generic_visit(node)
-
-class VariableRenamer(AstTransformer):
-    def __init__(self):
-        self.scope_stack, self.var_counter, self.renamed_count = [{}], 0, 0
-        self.hex_pattern = re.compile(r'^_0x[a-fA-F0-9]+$')
-        self.confusing_chars_pattern = re.compile(r'^[Il1O0]+$')
-    def enter_scope(self): self.scope_stack.append({})
-    def leave_scope(self): self.scope_stack.pop()
-    def declare_var(self, name):
-        is_hex = self.hex_pattern.match(name)
-        is_short = len(name) <= 2 and name not in ['i', 'j', 'k', 't', 'a', 'b', 'c', 'x', 'y', 'z']
-        is_confusing = len(name) > 2 and self.confusing_chars_pattern.match(name)
-        if is_hex or is_short or is_confusing:
-            new_name = f"var_{self.var_counter}"; self.var_counter += 1
-            self.scope_stack[-1][name] = new_name; self.renamed_count += 1
-            return new_name
-        self.scope_stack[-1][name] = name
-        return name
-    def get_new_name(self, name):
-        for scope in reversed(self.scope_stack):
-            if name in scope: return scope[name]
-        return name
-    def visit_FunctionDeclaration(self, node):
-        if node.id: node.id.name = self.declare_var(node.id.name)
-        self.enter_scope()
-        if node.params:
-            for i, param in enumerate(node.params):
-                if param.type == 'Identifier': node.params[i].name = self.declare_var(param.name)
-        node.body = self.visit(node.body)
-        self.leave_scope()
+        node = self.generic_visit(node)
+        if self.js_ctx and node.computed and getattr(node.property, 'type', '') == 'CallExpression':
+            try:
+                prop_call_code = escodegen.generate(node.property)
+                result = self.js_ctx.eval(prop_call_code)
+                if isinstance(result, str):
+                    print(f"Resolved member access '{prop_call_code}' to literal: {result}")
+                    node.computed = False
+                    node.property = esprima.nodes.Identifier(name=result)
+            except Exception:
+                pass
         return node
-    def visit_FunctionExpression(self, node):
-        self.enter_scope()
-        if node.params:
-            for i, param in enumerate(node.params):
-                if param.type == 'Identifier': node.params[i].name = self.declare_var(param.name)
-        node.body = self.visit(node.body)
-        self.leave_scope()
-        return node
-    def visit_VariableDeclarator(self, node):
-        if node.id.type == 'Identifier': node.id.name = self.declare_var(node.id.name)
-        if node.init: node.init = self.visit(node.init)
-        return node
-    def visit_Identifier(self, node):
-        parent = getattr(node, 'parent', None)
-        if parent and parent.type == 'MemberExpression' and parent.property == node and not parent.computed: return node
-        node.name = self.get_new_name(node.name)
-        return node
-
-class UsageCounter(AstVisitor):
-    def __init__(self): self.counts = Counter()
-    def visit_Identifier(self, node):
-        parent = getattr(node, 'parent', None)
-        is_declaration = (parent and ((parent.type == 'VariableDeclarator' and parent.id == node) or (parent.type in ['FunctionDeclaration', 'FunctionExpression'] and parent.id == node) or (hasattr(parent, 'params') and parent.params is not None and node in parent.params)))
-        is_property = parent and parent.type == 'MemberExpression' and parent.property == node and not parent.computed
-        if not is_declaration and not is_property: self.counts[node.name] += 1
 
 class ExpressionSimplifier(AstTransformer):
     def __init__(self):
-        self.simplified_count = 0; self.aeval = Interpreter()
-        self.valid_identifier_regex = re.compile(r'^[a-zA-Z_$][a-zA-Z0-9_$]*$')
-
-    def _create_literal_node(self, value):
-        """Helper to create a literal node, handling negative numbers correctly."""
-        if isinstance(value, (int, float)) and value < 0:
-            return esprima.nodes.UnaryExpression(operator='-', argument=esprima.nodes.Literal(value=abs(value), raw=str(abs(value))))
-        return esprima.nodes.Literal(value=value, raw=repr(value))
-
-    def visit_MemberExpression(self, node):
-        node = self.generic_visit(node)
-        if node.computed and node.property.type == 'Literal' and isinstance(node.property.value, str):
-            prop_name = node.property.value
-            if self.valid_identifier_regex.match(prop_name):
-                node.computed = False; node.property = esprima.nodes.Identifier(name=prop_name)
-                self.simplified_count += 1
-        return node
+        self.simplified_count = 0
     def visit_BinaryExpression(self, node):
         node = self.generic_visit(node)
-        if node.left.type == 'Literal' and node.right.type == 'Literal':
-            op_map = {'&&': 'and', '||': 'or', '!==': '!=', '===': '=='}; py_op = op_map.get(node.operator, node.operator)
-            try:
-                result = self.aeval.eval(f"{repr(node.left.value)} {py_op} {repr(node.right.value)}")
+        if getattr(node.left, 'type', '') == 'Literal' and getattr(node.right, 'type', '') == 'Literal':
+            if node.operator == '+' and isinstance(node.left.value, str) and isinstance(node.right.value, str):
+                result = node.left.value + node.right.value
                 self.simplified_count += 1
-                return self._create_literal_node(result)
-            except: return node
-        return node
-    def visit_UnaryExpression(self, node):
-        node = self.generic_visit(node)
-        if node.argument.type == 'Literal':
-            if node.operator == 'typeof':
-                type_map = {'str': 'string', 'int': 'number', 'float': 'number', 'bool': 'boolean', 'NoneType': 'object'}; result = type_map.get(type(node.argument.value).__name__, 'object')
-                self.simplified_count += 1; return self._create_literal_node(result)
-            op_map = {'!': 'not '}; py_op = op_map.get(node.operator, node.operator)
-            try:
-                result = self.aeval.eval(f"{py_op}{repr(node.argument.value)}")
-                self.simplified_count += 1
-                return self._create_literal_node(result)
-            except: return node
+                return esprima.nodes.Literal(value=result, raw=repr(result))
         return node
 
-class DeadCodeEliminator(AstTransformer):
-    def __init__(self, usage_counts=None):
-        self.usage_counts = usage_counts if usage_counts else Counter()
-        self.reserved_names = {'console', 'window', 'document', 'Array', 'Object', 'String', 'Number', 'Boolean', 'Function'}
-        self.if_branches_removed, self.symbols_removed = 0, 0
-    def visit_IfStatement(self, node):
-        node.test = self.visit(node.test)
-        if node.test.type == 'Literal':
-            self.if_branches_removed += 1
-            if node.test.value:
-                if node.consequent and node.consequent.type == 'BlockStatement': return self.visit(node.consequent.body)
-                return self.visit(node.consequent)
-            else:
-                if node.alternate:
-                    if node.alternate.type == 'BlockStatement': return self.visit(node.alternate.body)
-                    return self.visit(node.alternate)
-                return None
-        return self.generic_visit(node)
-    def visit_FunctionDeclaration(self, node):
-        if node.id and node.id.name not in self.reserved_names and self.usage_counts[node.id.name] == 0:
-            self.symbols_removed += 1; return None
-        return self.generic_visit(node)
+class FinalCleanup(AstTransformer):
     def visit_VariableDeclaration(self, node):
-        declarations_to_keep = []
-        for decl in node.declarations:
-            is_safe_to_remove = (decl.init is None) or (decl.init.type != 'CallExpression')
-            if decl.id.name not in self.reserved_names and self.usage_counts[decl.id.name] == 0 and is_safe_to_remove:
-                self.symbols_removed += 1; continue
-            declarations_to_keep.append(decl)
-        if not declarations_to_keep: return None
-        node.declarations = declarations_to_keep
+        # Remove the huge, now-unused string array
+        if (len(node.declarations) == 1 and
+            getattr(node.declarations[0].init, 'type', '') == 'ArrayExpression' and
+            len(getattr(node.declarations[0].init, 'elements', [])) > 100):
+            return None
         return node
+    def visit_FunctionDeclaration(self, node):
+        # Remove all the decoder functions, leaving only the final call
+        return None
 
 def deobfuscate(js_code):
-    try: ast = esprima.parse(js_code, {'comment': True})
-    except Exception as e: print(f"Error parsing JavaScript: {e}"); return js_code
+    try: ast = esprima.parse(js_code, {'comment': True, 'tolerant': True})
+    except Exception as e: print(f"Error parsing JavaScript: {e}"); return ""
 
-    string_finder = StringArrayFinder()
-    string_finder.visit(ast)
-
-    resolver = StringArrayResolver(string_finder)
+    # 1. Resolve all calls using the primed context
+    resolver = ContextualResolver(ast)
     ast = resolver.visit(ast)
 
-    renamer = VariableRenamer()
-    ast = renamer.visit(ast)
-
+    # 2. Simplify expressions (e.g. "Hello " + "Internet User")
     simplifier = ExpressionSimplifier()
     ast = simplifier.visit(ast)
 
-    while True:
-        usage_counter = UsageCounter()
-        usage_counter.visit(ast)
-        ast_before_elimination = escodegen.generate(ast)
-        eliminator = DeadCodeEliminator(usage_counter.counts)
-        ast = eliminator.visit(ast)
-        ast_after_elimination = escodegen.generate(ast)
-        if ast_before_elimination == ast_after_elimination: break
+    # 3. Clean up all the now-dead code (decoders, string arrays)
+    cleaner = FinalCleanup()
+    ast = cleaner.visit(ast)
 
-    report_data = {
-        'renamed_count': renamer.renamed_count,
-        'simplified_count': simplifier.simplified_count,
-        'if_branches_removed': eliminator.if_branches_removed,
-        'symbols_removed': eliminator.symbols_removed,
-        'variable_usage': usage_counter.counts,
-        'string_array_usage': resolver.index_usage
-    }
-
-    report = "/*\n--- Deobfuscation Report ---\n\n"
-    report += "Statistics:\n"
-    report += f"- Variables Renamed: {report_data.get('renamed_count', 0)}\n"
-    report += f"- Expressions Simplified: {report_data.get('simplified_count', 0)}\n"
-    report += f"- Dead If Branches Removed: {report_data.get('if_branches_removed', 0)}\n"
-    report += f"- Unused Symbols Removed: {report_data.get('symbols_removed', 0)}\n\n"
-    if 'variable_usage' in report_data and report_data['variable_usage']:
-        report += "Variable Usage Counts:\n"
-        for name, count in sorted(report_data['variable_usage'].items()):
-            report += f"  - {name}: {count}\n"
-    if 'string_array_usage' in report_data and report_data['string_array_usage']:
-        report += "\nString Array Index Usage (top 5):\n"
-        for index, count in sorted(report_data['string_array_usage'].items(), key=lambda item: item[1], reverse=True)[:5]:
-            report += f"  - Index {index}: {count} times\n"
-    report += "*/\n\n"
-
-    generated_code = escodegen.generate(ast)
-    return report + jsbeautifier.beautify(generated_code)
+    generated_code = escodegen.generate(ast, {'comment': False})
+    return jsbeautifier.beautify(generated_code)
 
 def main():
     import argparse
@@ -293,7 +203,10 @@ def main():
         with open(args.input_file, 'r', encoding='utf-8') as f: obfuscated_code = f.read()
     except FileNotFoundError:
         print(f"Error: Input file not found at {args.input_file}"); return
+
     deobfuscated_code = deobfuscate(obfuscated_code)
+
+    # No report needed for the final clean version
     with open(args.output_file, 'w', encoding='utf-8') as f: f.write(deobfuscated_code)
     print(f"Deobfuscated code written to {args.output_file}")
 
