@@ -117,6 +117,18 @@ class ContextualResolver(AstTransformer):
         node = self.generic_visit(node)
         if not self.js_ctx: return node
 
+        # Check if we are inside a function declaration, if so, don't resolve
+        parent = getattr(node, 'parent', None)
+        in_func_decl = False
+        while parent:
+            if parent.type == 'FunctionDeclaration':
+                in_func_decl = True
+                break
+            parent = getattr(parent, 'parent', None)
+
+        if in_func_decl:
+            return node
+
         if node.callee.type == 'Identifier':
             # Use a broader check: if the function exists in the context, try to resolve it.
             # This is safe because we primed the context with the nested functions.
@@ -171,8 +183,8 @@ class FinalCleanup(AstTransformer):
             return None
         return node
     def visit_FunctionDeclaration(self, node):
-        # Remove all the decoder functions, leaving only the final call
-        return None
+        # We keep the function declarations, as some of them might still be used.
+        return node
 
 def deobfuscate(js_code):
     try: ast = esprima.parse(js_code, {'comment': True, 'tolerant': True})
