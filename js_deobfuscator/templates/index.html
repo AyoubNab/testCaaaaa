@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JavaScript Deobfuscator</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>JavaScript Deobfuscator</h1>
+        <p>Paste your obfuscated code below and click "Deobfuscate".</p>
+        <form action="/" method="post">
+            <div class="editor-container">
+                <div class="editor-wrapper">
+                    <h2>Obfuscated Code</h2>
+                    <textarea name="obfuscated_code" id="obfuscated_code" class="code-editor" spellcheck="false">{{ obfuscated_code }}</textarea>
+                </div>
+                <div class="editor-wrapper">
+                    <h2>Deobfuscated Code</h2>
+                    <textarea id="deobfuscated_code" class="code-editor" readonly>{{ deobfuscated_code }}</textarea>
+                </div>
+            </div>
+            <button type="submit" class="submit-btn">Deobfuscate</button>
+        </form>
+    </div>
+</body>
+</html>
