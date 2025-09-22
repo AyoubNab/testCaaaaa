@@ -14,10 +14,8 @@ def index():
     if request.method == 'POST':
         obfuscated_code = request.form.get('obfuscated_code', '')
         if obfuscated_code:
-            # The deobfuscate function returns the code and a report dictionary.
-            # For the web UI, we'll just show the code.
-            clean_code, _ = deobfuscate(obfuscated_code)
-            deobfuscated_code = clean_code
+            # The deobfuscate function now returns only the deobfuscated code.
+            deobfuscated_code = deobfuscate(obfuscated_code)
 
     return render_template('index.html', obfuscated_code=obfuscated_code, deobfuscated_code=deobfuscated_code)
 
