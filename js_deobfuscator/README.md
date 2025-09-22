@@ -30,14 +30,16 @@ The script uses a few Python libraries. You can install them using the provided 
 
 The script is run from the command line and takes two arguments: the input file path and the output file path.
 
+Navigate to the `js_deobfuscator` directory.
+
 ```bash
-python deobfuscator.py <path_to_input.js> <path_to_output.js>
+python src/deobfuscator.py <path_to_input.js> <path_to_output.js>
 ```
 
 **Example:**
 
 ```bash
-python deobfuscator.py sample_obfuscated.js sample_deobfuscated.js
+python src/deobfuscator.py samples/sample_obfuscated.js samples/sample_deobfuscated.js
 ```
 
 ## How It Works
